@@ -16,6 +16,7 @@ server-side endpointing and in-band configuration updates.
 import asyncio
 import base64
 import json
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field, fields
 from typing import Any, Literal, cast
@@ -48,6 +49,7 @@ from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.errors import ErrorCategory
+from pipecat.utils.network import QuickFailureTracker, exponential_backoff_time
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
@@ -174,10 +176,26 @@ class SarvamSTTSettings(STTSettings):
     num_initial_ignored_frames: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
+# Seconds without audio before a keepalive is sent. Keeps an idle connection,
+# such as that of an inactive `ServiceSwitcher` member, from being closed by the
+# server.
+_DEFAULT_KEEPALIVE_TIMEOUT = 10.0
+_DEFAULT_CONNECT_TIMEOUT = 8.0
+
+
+class _SarvamConnectTimeout(Exception):
+    """Raised when the Sarvam websocket handshake exceeds the connect timeout."""
+
+
 class SarvamSTTService(STTService):
     """Sarvam speech-to-text service.
 
     Provides real-time speech recognition using Sarvam's WebSocket API.
+
+    A connection that fails to open, or drops while the service is running, is
+    re-established in the background, with incoming audio buffered meanwhile. Once
+    the attempts are exhausted the failure is reported as permanent, which leaves
+    the service unusable so a ``ServiceSwitcher`` can fail over.
 
     Event handlers available (in addition to STTService events):
 
@@ -232,8 +250,11 @@ class SarvamSTTService(STTService):
         params: InputParams | None = None,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = SARVAM_TTFS_P99,
-        keepalive_timeout: float | None = None,
+        keepalive_timeout: float | None = _DEFAULT_KEEPALIVE_TIMEOUT,
         keepalive_interval: float = 5.0,
+        reconnect_attempts: int = 2,
+        reconnect_backoff: float = 1.0,
+        connect_timeout: float = _DEFAULT_CONNECT_TIMEOUT,
         **kwargs,
     ):
         """Initialize the Sarvam STT service.
@@ -262,8 +283,15 @@ class SarvamSTTService(STTService):
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
                 Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
             keepalive_timeout: Seconds of no audio before sending silence to keep the
-                connection alive. None disables keepalive.
+                connection alive. None disables keepalive. Defaults to 10 seconds.
             keepalive_interval: Seconds between idle checks when keepalive is enabled.
+            reconnect_attempts: How many times to try re-establishing a connection
+                that failed to open or dropped, before the service is reported as
+                permanently failed.
+            reconnect_backoff: Seconds to wait before the first reconnect retry. The
+                wait doubles on each further retry, up to four times this value.
+            connect_timeout: Seconds to wait for the websocket handshake before the
+                service is reported as permanently failed. Defaults to 8 seconds.
             **kwargs: Additional arguments passed to the parent STTService.
         """
         # --- 1. Hardcoded defaults ---
@@ -349,6 +377,17 @@ class SarvamSTTService(STTService):
         self._websocket_context = None
         self._socket_client = None
         self._receive_task = None
+        self._reconnect_attempts = reconnect_attempts
+        self._reconnect_backoff = reconnect_backoff
+        self._connect_timeout = connect_timeout
+        self._recovery_task: asyncio.Task | None = None
+        # True from the start of an intentional disconnect until the next connect,
+        # so the receive loop ending then isn't mistaken for a dropped connection.
+        self._disconnecting = False
+        self._connected_at = 0.0
+        # A server that accepts the connection and closes it right away (rejected
+        # credentials, say) would otherwise be reconnected to indefinitely.
+        self._quick_failure_tracker = QuickFailureTracker()
         # Warn only once per unrecognized language code, so a session stuck
         # detecting one unmapped language doesn't spam a warning per turn.
         self._unmapped_language_codes_warned: set[str] = set()
@@ -457,6 +496,7 @@ class SarvamSTTService(STTService):
             "num_initial_ignored_frames",
         }
         if changed.keys() & reconnect_fields:
+            await self._cancel_recovery_task()
             await self._disconnect()
             await self._connect()
 
@@ -482,6 +522,7 @@ class SarvamSTTService(STTService):
             frame: The end frame.
         """
         await super().stop(frame)
+        await self._cancel_recovery_task()
         await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
@@ -491,6 +532,7 @@ class SarvamSTTService(STTService):
             frame: The cancel frame.
         """
         await super().cancel(frame)
+        await self._cancel_recovery_task()
         await self._disconnect()
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
@@ -500,9 +542,14 @@ class SarvamSTTService(STTService):
             audio: Raw audio bytes to transcribe.
 
         Yields:
-            Frame: None (transcription results come via WebSocket callbacks).
+            Frame: None (transcription results come via WebSocket callbacks), or an
+            ErrorFrame when the audio could not be sent.
         """
         if not self._socket_client:
+            # Audio only gets here when no recovery is under way to buffer it, so
+            # start one rather than dropping audio on a connection nobody is
+            # restoring. After an intentional disconnect there is nothing to restore.
+            self._start_recovery()
             yield None
             return
 
@@ -527,13 +574,48 @@ class SarvamSTTService(STTService):
             await self._socket_client.transcribe(**method_kwargs)
 
         except Exception as e:
+            self._start_recovery()
             yield ErrorFrame(error=f"Error sending audio to Sarvam: {e}", exception=e)
 
         yield None
 
-    async def _connect(self):
-        """Connect to Sarvam WebSocket API using the SDK."""
+    async def _connect(self) -> bool:
+        """Connect to Sarvam, recovering in the background if the connection fails.
+
+        Returns:
+            True if the connection opened.
+        """
+        self._quick_failure_tracker.reset()
+        try:
+            await self._open_connection()
+        except _SarvamConnectTimeout as e:
+            # A hung handshake would stall call start; fail permanently so a
+            # ServiceSwitcher can move on instead of retrying in the background.
+            await self._call_event_handler("on_connection_error", str(e))
+            await self.push_error(
+                error_msg=f"Failed to connect to Sarvam: {e}",
+                exception=e,
+                force_treat_as_permanent=True,
+            )
+            return False
+        except Exception as e:
+            prefix = (
+                "Sarvam API error" if isinstance(e, ApiError) else "Failed to connect to Sarvam"
+            )
+            await self._call_event_handler("on_connection_error", str(e))
+            await self.push_error(error_msg=f"{prefix}: {e}", exception=e)
+            self._start_recovery()
+            return False
+        return True
+
+    async def _open_connection(self):
+        """Open the Sarvam WebSocket and start listening and keepalive.
+
+        Raises:
+            Exception: If the connection could not be opened.
+        """
         logger.debug("Connecting to Sarvam")
+        self._disconnecting = False
 
         try:
             # Build common connection parameters
@@ -597,7 +679,14 @@ class SarvamSTTService(STTService):
                 )
 
             # Enter the async context manager
-            self._socket_client = await self._websocket_context.__aenter__()
+            try:
+                self._socket_client = await asyncio.wait_for(
+                    self._websocket_context.__aenter__(), timeout=self._connect_timeout
+                )
+            except TimeoutError as e:
+                raise _SarvamConnectTimeout(
+                    f"Sarvam websocket connect timed out after {self._connect_timeout}s"
+                ) from e
 
             # Register event handler for incoming messages
             def _message_handler(message):
@@ -612,19 +701,28 @@ class SarvamSTTService(STTService):
 
             self._create_keepalive_task()
 
+            self._connected_at = time.monotonic()
             logger.info("Connected to Sarvam successfully")
-
-        except ApiError as e:
+        except Exception:
             self._socket_client = None
             self._websocket_context = None
-            await self.push_error(error_msg=f"Sarvam API error: {e}", exception=e)
-        except Exception as e:
-            self._socket_client = None
-            self._websocket_context = None
-            await self.push_error(error_msg=f"Failed to connect to Sarvam: {e}", exception=e)
+            raise
 
     async def _disconnect(self):
         """Disconnect from Sarvam WebSocket API using SDK."""
+        error = await self._close_connection()
+        if error:
+            await self.push_error(
+                error_msg=f"Error closing WebSocket connection: {error}", exception=error
+            )
+
+    async def _close_connection(self) -> Exception | None:
+        """Stop the connection's tasks and close the WebSocket.
+
+        Returns:
+            The exception raised while closing the WebSocket, if any.
+        """
+        self._disconnecting = True
         await self._cancel_keepalive_task()
 
         if self._receive_task:
@@ -638,31 +736,122 @@ class SarvamSTTService(STTService):
         self._socket_client = None
         self._websocket_context = None
 
+        error = None
         if websocket_context and socket_client:
             try:
                 await websocket_context.__aexit__(None, None, None)
             except Exception as e:
-                await self.push_error(
-                    error_msg=f"Error closing WebSocket connection: {e}", exception=e
-                )
+                error = e
             finally:
                 logger.debug("Disconnected from Sarvam WebSocket")
+        return error
+
+    def _start_recovery(self):
+        """Start re-establishing the connection in the background.
+
+        Does nothing during an intentional disconnect, once the service is
+        unusable, or while a recovery is already under way.
+        """
+        if self._disconnecting or not self.is_usable or self._reconnecting:
+            return
+        if self._recovery_task and not self._recovery_task.done():
+            return
+        self._recovery_task = self.create_task(self._reconnect(), name="recovery")
+
+    async def _cancel_recovery_task(self):
+        """Stop a recovery that is under way."""
+        if self._recovery_task:
+            await self.cancel_task(self._recovery_task)
+            self._recovery_task = None
+
+    async def _do_reconnect(self):
+        """Re-open the connection, trying a bounded number of times.
+
+        Called by ``STTService._reconnect()``, which buffers incoming audio for
+        the duration and replays it afterwards. When every attempt fails the
+        failure is reported as permanent, so the service stops accepting work and a
+        ``ServiceSwitcher`` fails over.
+        """
+        last_error: Exception | None = None
+        for attempt in range(1, self._reconnect_attempts + 1):
+            # Closing a connection that already died commonly fails; that is not
+            # a separate problem worth reporting.
+            close_error = await self._close_connection()
+            if close_error:
+                logger.debug(f"{self} error closing the old connection: {close_error}")
+            try:
+                await self._open_connection()
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"{self} reconnect attempt {attempt}/{self._reconnect_attempts} failed: {e}"
+                )
+                await self._call_event_handler("on_connection_error", str(e))
+                if attempt < self._reconnect_attempts:
+                    await asyncio.sleep(
+                        exponential_backoff_time(
+                            attempt,
+                            min_wait=self._reconnect_backoff,
+                            max_wait=self._reconnect_backoff * 4,
+                        )
+                    )
+        await self.push_error(
+            error_msg=(
+                f"Failed to reconnect to Sarvam after {self._reconnect_attempts} attempts: "
+                f"{last_error}"
+            ),
+            exception=last_error,
+            force_treat_as_permanent=True,
+        )
 
     async def _receive_task_handler(self):
         """Handle incoming messages from Sarvam WebSocket.
 
         This task wraps the SDK's start_listening() method which processes
-        messages via the registered event handler callback.
+        messages via the registered event handler callback. The SDK reports a
+        dropped connection by returning from it, so it returning outside an
+        intentional disconnect means the connection was lost.
         """
         if not self._socket_client:
             return
 
+        error: Exception | None = None
         try:
             # Start listening for messages from the Sarvam SDK
             # Messages will be handled via the _message_handler callback
             await self._socket_client.start_listening()
         except Exception as e:
-            await self.push_error(error_msg=f"Sarvam receive task error: {e}", exception=e)
+            error = e
+
+        if not self._disconnecting:
+            await self._handle_connection_lost(error)
+
+    async def _handle_connection_lost(self, error: Exception | None):
+        """Recover from a connection that closed unexpectedly.
+
+        Args:
+            error: The exception the receive loop ended with, if any.
+        """
+        reason = "Sarvam connection closed unexpectedly"
+        if error:
+            reason += f": {error}"
+        result = self._quick_failure_tracker.record(time.monotonic() - self._connected_at)
+        if result.should_give_up:
+            await self.push_error(
+                error_msg=(
+                    f"{reason}; the connection closed within "
+                    f"{self._quick_failure_tracker.min_stable_duration:.0f}s of opening "
+                    f"{self._quick_failure_tracker.max_consecutive_failures} times in a row"
+                ),
+                exception=error,
+                force_treat_as_permanent=True,
+            )
+            return
+
+        logger.warning(f"{self} {reason}")
+        await self._call_event_handler("on_connection_error", reason)
+        self._start_recovery()
 
     async def _handle_message(self, message):
         """Handle incoming WebSocket message from Sarvam SDK.
@@ -672,7 +861,14 @@ class SarvamSTTService(STTService):
         Args:
             message: The parsed response object from Sarvam WebSocket.
         """
-        logger.debug(f"Received response: {message}")
+        # The full payload is large and arrives per message; keep it at trace.
+        logger.trace(f"Received response: {message}")
+        data = getattr(message, "data", None)
+        logger.debug(
+            f"Sarvam response: type={getattr(message, 'type', None)} "
+            f"language={getattr(data, 'language_code', None)} "
+            f"transcript_len={len(getattr(data, 'transcript', None) or '')}"
+        )
 
         try:
             if message.type == "events":
@@ -807,10 +1003,20 @@ class SarvamSTTService(STTService):
         # _send_keepalive(), gates on it
         assert self._socket_client is not None
 
-        await self._socket_client.transcribe(**method_kwargs)
+        try:
+            await self._socket_client.transcribe(**method_kwargs)
+        except Exception:
+            # The keepalive loop stops on a send error, so recovery is what restarts it.
+            self._start_recovery()
+            raise
 
 
 _REALTIME_MODEL = "saaras:v3-realtime"
+
+# Attempts made to open the realtime websocket at startup, and the pause between
+# them. A connection that drops later is not retried.
+_REALTIME_CONNECT_ATTEMPTS = 2
+_REALTIME_CONNECT_RETRY_WAIT = 1.0
 
 # Sarvam's realtime endpoint serves both generations over the same connection
 # parameters and event protocol, so only the model string differs. The default
@@ -958,6 +1164,11 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
     after the server's silence window and would time a shorter interval than
     every other STT service reports. Under ``manual`` those same frames also mark
     the turn for Sarvam, reaching it as ``speech_start`` and ``speech_end``.
+
+    The websocket is not reconnected once it has dropped, since the provider
+    session cannot be resumed. A socket that cannot be opened at startup, a dropped
+    one, and an error the provider marks fatal each leave the service unusable, so
+    a ``ServiceSwitcher`` can fail over.
     """
 
     Settings = SarvamRealtimeSTTSettings
@@ -975,6 +1186,8 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         settings: Settings | None = None,
         should_interrupt: bool = True,
         ttfs_p99_latency: float | None = SARVAM_REALTIME_TTFS_P99,
+        keepalive_timeout: float | None = _DEFAULT_KEEPALIVE_TIMEOUT,
+        connect_timeout: float = _DEFAULT_CONNECT_TIMEOUT,
         **kwargs,
     ):
         """Initialize Sarvam realtime STT.
@@ -999,6 +1212,10 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
                 user-supplied ``user_turn_strategies`` overrides the recommendation
                 and this setting with it. Defaults to True.
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
+            keepalive_timeout: Seconds of no audio before sending a ping to keep the
+                connection alive. None disables keepalive. Defaults to 10 seconds.
+            connect_timeout: Seconds to wait for each websocket connect before the
+                service is reported as permanently failed. Defaults to 8 seconds.
             **kwargs: Additional arguments passed to :class:`WebsocketSTTService`.
         """
         settings_fields = {setting.name for setting in fields(self.Settings)}
@@ -1046,6 +1263,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             sample_rate=sample_rate,
             settings=default_settings,
             ttfs_p99_latency=ttfs_p99_latency,
+            keepalive_timeout=keepalive_timeout,
             reconnect_on_error=False,
             **kwargs,
         )
@@ -1062,6 +1280,8 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         self._speech_end_audio_position_s: float | None = None
         self._audio_position_bytes = 0
         self._endpointing = endpointing
+        self._connect_timeout = connect_timeout
+        self._connect_timed_out = False
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing and usage metrics."""
@@ -1164,8 +1384,27 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
     async def _connect(self):
         """Connect to Sarvam realtime and start receive task."""
         await super()._connect()
-        await self._connect_websocket()
-        if self._websocket and not self._receive_task:
+        self._connect_timed_out = False
+        for attempt in range(1, _REALTIME_CONNECT_ATTEMPTS + 1):
+            await self._connect_websocket()
+            if self._websocket:
+                break
+            if self._connect_timed_out:
+                # Already reported as permanent; retrying would only stall call start.
+                return
+            if attempt < _REALTIME_CONNECT_ATTEMPTS:
+                await asyncio.sleep(_REALTIME_CONNECT_RETRY_WAIT)
+        else:
+            # Nothing reconnects a service that never connected, so the failure is final.
+            await self.push_error(
+                error_msg=(
+                    "Unable to connect to Sarvam realtime STT after "
+                    f"{_REALTIME_CONNECT_ATTEMPTS} attempts"
+                ),
+                force_treat_as_permanent=True,
+            )
+            return
+        if not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
     async def _disconnect(self):
@@ -1193,12 +1432,26 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             url = self._build_ws_url()
             headers = {"API-SUBSCRIPTION-KEY": self._api_key}
             logger.debug(f"Connecting to Sarvam realtime STT WebSocket: {url}")
-            self._websocket = await self._websocket_connect(
-                url,
-                additional_headers=headers,
-                user_agent_header=sdk_headers()["User-Agent"],
+            self._websocket = await asyncio.wait_for(
+                self._websocket_connect(
+                    url,
+                    additional_headers=headers,
+                    user_agent_header=sdk_headers()["User-Agent"],
+                ),
+                timeout=self._connect_timeout,
             )
             await self._call_event_handler("on_connected")
+        except TimeoutError:
+            self._websocket = None
+            self._connect_timed_out = True
+            await self.push_error(
+                error_msg=(
+                    "Unable to connect to Sarvam realtime STT: timed out after "
+                    f"{self._connect_timeout}s"
+                ),
+                force_treat_as_permanent=True,
+            )
+            await self._call_event_handler("on_connection_error", "connect timeout")
         except Exception as e:
             self._websocket = None
             # Left on the category the failure earns: `_try_reconnect` skips a
@@ -1420,9 +1673,13 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         await self._complete_active_utterance()
 
     async def _handle_error(self, message: dict[str, Any]):
-        await self.push_error(
-            error_msg=f"Sarvam realtime STT error: {json.dumps(message, ensure_ascii=False)}",
-        )
+        error_msg = f"Sarvam realtime STT error: {json.dumps(message, ensure_ascii=False)}"
+        # An error the provider marks fatal ends the session, so the service
+        # can't do any more work.
+        if message.get("is_fatal") is True:
+            await self.push_error(error_msg=error_msg, force_treat_as_permanent=True)
+        else:
+            await self.push_error(error_msg=error_msg)
 
     async def _send_audio_chunk(self, chunk: bytes):
         if not self._websocket:

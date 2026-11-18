@@ -46,8 +46,16 @@ class EmptyUserTurnConfig:
         max_consecutive_recoveries: How many empty turns in a row are answered.
             Further ones are left unanswered until the user says something that
             is transcribed.
+        idle_min_speech_secs: Minimum detected speech, in seconds, an idle
+            empty turn needs before ``idle_prompt`` is used. Shorter turns are
+            treated as blips and left unanswered. Interrupted turns ignore it.
+        repeat_prompt: Developer message used instead of the interrupted/idle
+            prompt once a recovery has already run for an earlier empty turn
+            in a row. ``None`` keeps using the first-attempt prompts.
     """
 
     interrupted_prompt: str | None = DEFAULT_EMPTY_USER_TURN_INTERRUPTED_PROMPT
     idle_prompt: str | None = None
     max_consecutive_recoveries: int = 1
+    idle_min_speech_secs: float = 0.0
+    repeat_prompt: str | None = None

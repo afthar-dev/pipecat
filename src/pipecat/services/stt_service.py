@@ -435,6 +435,12 @@ class STTService(AIService):
             self._reconnect_audio_buffer.append((frame, direction))
             return
 
+        await self._process_audio_frame_unbuffered(frame, direction)
+
+    async def _process_audio_frame_unbuffered(
+        self, frame: InputAudioRawFrame, direction: FrameDirection
+    ):
+        """Process an audio frame, bypassing the reconnect buffer."""
         if self._muted:
             return
 
@@ -707,22 +713,26 @@ class STTService(AIService):
         self._reconnecting = True
         self._need_reconnect = False
         try:
-            await self._do_reconnect()
-        except Exception as e:
-            msg = f"{self} reconnect failed: {e}"
-            # push_error is the report; a matching ERROR line would attribute
-            # this one failure a second time.
-            logger.warning(msg)
-            await self._call_event_handler("on_connection_error", str(e))
-            await self.push_error(msg, exception=e)
-            return
+            try:
+                await self._do_reconnect()
+            except Exception as e:
+                msg = f"{self} reconnect failed: {e}"
+                # push_error is the report; a matching ERROR line would attribute
+                # this one failure a second time.
+                logger.warning(msg)
+                await self._call_event_handler("on_connection_error", str(e))
+                await self.push_error(msg, exception=e)
+                return
+
+            # Replay buffered audio while still in reconnecting mode so frames that
+            # arrive meanwhile keep appending to the buffer behind the replayed
+            # ones. The flag is cleared (in ``finally``) right after the loop sees
+            # an empty buffer with no await in between, keeping the PCM in order.
+            while self._reconnect_audio_buffer:
+                buffered_frame, buffered_direction = self._reconnect_audio_buffer.pop(0)
+                await self._process_audio_frame_unbuffered(buffered_frame, buffered_direction)
         finally:
             self._reconnecting = False
-
-        # Replay audio frames that arrived while the connection was down.
-        for buffered_frame, buffered_direction in self._reconnect_audio_buffer:
-            await self.process_audio_frame(buffered_frame, buffered_direction)
-        self._reconnect_audio_buffer.clear()
 
     async def _do_reconnect(self):
         """Perform the service-specific connection reset.

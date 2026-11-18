@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import base64
 import json
 from dataclasses import fields
@@ -20,6 +21,7 @@ pytest.importorskip("sarvamai")
 import pipecat.processors.frameworks.rtvi.models as RTVI
 from pipecat.frames.frames import (
     ErrorFrame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     MetricsFrame,
     ProposedUserStartedSpeakingFrame,
@@ -29,6 +31,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.metrics.metrics import STTUsageMetricsData
+from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyFailover
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi.processor import RTVIProcessor
 from pipecat.services.sarvam._sdk import sdk_headers
@@ -41,6 +44,7 @@ from pipecat.services.sarvam.stt import (
 )
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import WebsocketSTTService
+from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -1123,8 +1127,10 @@ async def test_sarvam_error_is_reported_without_reconnect(monkeypatch):
     try_reconnect = AsyncMock(return_value=False)
     pushed_errors = []
 
-    async def fake_push_error(error_msg, exception=None, fatal=False):
-        pushed_errors.append((error_msg, exception, fatal))
+    async def fake_push_error(
+        error_msg, exception=None, fatal=False, force_treat_as_permanent=False
+    ):
+        pushed_errors.append((error_msg, exception, fatal, force_treat_as_permanent))
 
     monkeypatch.setattr(
         service,
@@ -1148,6 +1154,8 @@ async def test_sarvam_error_is_reported_without_reconnect(monkeypatch):
     await service._receive_task_handler(report_error)
 
     assert pushed_errors[0][2] is False
+    # The provider marked the error fatal, so the service can't do any more work.
+    assert pushed_errors[0][3] is True
     try_reconnect.assert_not_awaited()
     report_error.assert_awaited_once()
 
@@ -1157,8 +1165,10 @@ async def test_error_preserves_raw_payload(monkeypatch):
     service = SarvamRealtimeSTTService(api_key="test-key")
     pushed_errors = []
 
-    async def fake_push_error(error_msg, exception=None, fatal=False):
-        pushed_errors.append((error_msg, exception, fatal))
+    async def fake_push_error(
+        error_msg, exception=None, fatal=False, force_treat_as_permanent=False
+    ):
+        pushed_errors.append((error_msg, exception, fatal, force_treat_as_permanent))
 
     monkeypatch.setattr(service, "push_error", fake_push_error)
 
@@ -1175,6 +1185,7 @@ async def test_error_preserves_raw_payload(monkeypatch):
     assert "invalid_subscription_key" in pushed_errors[0][0]
     assert pushed_errors[0][1] is None
     assert pushed_errors[0][2] is False
+    assert pushed_errors[0][3] is True
 
 
 async def _consume(generator):
@@ -1241,3 +1252,388 @@ def test_get_language_string_returns_model_default_when_unset():
 
     assert service._get_language_string() == service._config.default_language
     assert service._config.default_language == "unknown"
+
+
+#
+# Connection recovery for the non-realtime service.
+#
+
+
+class _FakeSocket:
+    """Stands in for the SDK's streaming socket client."""
+
+    def __init__(self, *, reply=None, drop_after_send=False, fail_send=False, dropped=False):
+        self.reply = reply
+        self.drop_after_send = drop_after_send
+        self.fail_send = fail_send
+        self.sent = []
+        self.handlers = []
+        self.dropped = asyncio.Event()
+        if dropped:
+            self.dropped.set()
+
+    def on(self, event, handler):
+        self.handlers.append(handler)
+
+    async def start_listening(self):
+        # Like the SDK, returns once the connection is gone rather than raising.
+        await self.dropped.wait()
+
+    async def transcribe(self, **kwargs):
+        if self.fail_send:
+            raise ConnectionError("socket is closed")
+        self.sent.append(kwargs)
+        if self.reply:
+            for handler in self.handlers:
+                handler(_FakeSarvamMessage(self.reply))
+        if self.drop_after_send:
+            self.dropped.set()
+
+    async def flush(self):
+        pass
+
+
+class _FakeConnection:
+    """Async context manager returned by the SDK's ``connect()``."""
+
+    def __init__(self, outcome):
+        self._outcome = outcome
+
+    async def __aenter__(self):
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
+
+    async def __aexit__(self, *exc_info):
+        return None
+
+
+class _FakeSarvamClient:
+    """Hands out one scripted outcome per connection attempt, repeating the last."""
+
+    def __init__(self, *outcomes):
+        self._outcomes = list(outcomes)
+        self.connects = 0
+        self.speech_to_text_streaming = self
+
+    def connect(self, **kwargs):
+        outcome = self._outcomes[min(self.connects, len(self._outcomes) - 1)]
+        self.connects += 1
+        return _FakeConnection(outcome)
+
+
+def _recovering_service(client, **kwargs):
+    kwargs.setdefault("reconnect_backoff", 0)
+    service = SarvamSTTService(api_key="test-key", **kwargs)
+    service._sarvam_client = client
+    return service
+
+
+def _audio():
+    return InputAudioRawFrame(audio=b"\x01\x00" * 160, sample_rate=16000, num_channels=1)
+
+
+def _error_messages(frames):
+    return [frame.error for frame in frames if isinstance(frame, ErrorFrame)]
+
+
+@pytest.mark.asyncio
+async def test_dropped_socket_is_reconnected_and_later_audio_is_transcribed():
+    first = _FakeSocket(drop_after_send=True)
+    second = _FakeSocket(reply="after the drop")
+    client = _FakeSarvamClient(first, second)
+    service = _recovering_service(client)
+
+    down, up = await run_test(
+        service,
+        frames_to_send=[_audio(), SleepFrame(sleep=0.3), _audio(), SleepFrame(sleep=0.1)],
+    )
+
+    assert client.connects == 2
+    assert len(first.sent) == 1
+    assert len(second.sent) == 1
+    assert [f.text for f in down if isinstance(f, TranscriptionFrame)] == ["after the drop"]
+    assert service.is_usable is True
+    assert _error_messages(up) == []
+
+
+@pytest.mark.asyncio
+async def test_audio_during_reconnect_is_buffered_and_replayed():
+    first = _FakeSocket(drop_after_send=True)
+    second = _FakeSocket()
+    client = _FakeSarvamClient(first, second)
+    service = _recovering_service(client, reconnect_backoff=0.2)
+
+    await run_test(
+        service,
+        frames_to_send=[
+            _audio(),
+            SleepFrame(sleep=0.05),
+            _audio(),
+            _audio(),
+            SleepFrame(sleep=0.5),
+        ],
+    )
+
+    # Both frames sent while the second connection was being opened arrive on it.
+    assert len(first.sent) == 1
+    assert len(second.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_send_triggers_reconnect():
+    first = _FakeSocket(fail_send=True)
+    second = _FakeSocket()
+    client = _FakeSarvamClient(first, second)
+    service = _recovering_service(client)
+
+    _, up = await run_test(
+        service,
+        frames_to_send=[_audio(), SleepFrame(sleep=0.3), _audio(), SleepFrame(sleep=0.1)],
+    )
+
+    assert client.connects == 2
+    assert len(second.sent) == 1
+    assert len(_error_messages(up)) == 1
+    assert "Error sending audio to Sarvam" in _error_messages(up)[0]
+    assert service.is_usable is True
+
+
+@pytest.mark.asyncio
+async def test_failed_reconnect_makes_the_service_unusable_and_reports_the_error():
+    first = _FakeSocket(drop_after_send=True)
+    client = _FakeSarvamClient(first, ConnectionError("down"))
+    service = _recovering_service(client, reconnect_attempts=2)
+
+    _, up = await run_test(service, frames_to_send=[_audio(), SleepFrame(sleep=0.3)])
+
+    # The original connection plus two reconnect attempts.
+    assert client.connects == 3
+    assert service.is_usable is False
+    errors = _error_messages(up)
+    assert any("Failed to reconnect to Sarvam after 2 attempts" in e for e in errors)
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_connect_is_retried_then_makes_the_service_unusable():
+    client = _FakeSarvamClient(ConnectionError("no route to host"))
+    service = _recovering_service(client, reconnect_attempts=2)
+
+    _, up = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    assert client.connects == 3
+    assert service.is_usable is False
+    errors = _error_messages(up)
+    assert any("Failed to connect to Sarvam" in e for e in errors)
+    assert any("Failed to reconnect to Sarvam" in e for e in errors)
+
+
+@pytest.mark.asyncio
+async def test_initial_connect_failure_recovers_when_a_retry_succeeds():
+    socket = _FakeSocket(reply="hello")
+    client = _FakeSarvamClient(ConnectionError("flaky"), socket)
+    service = _recovering_service(client)
+
+    down, _ = await run_test(
+        service,
+        frames_to_send=[SleepFrame(sleep=0.2), _audio(), SleepFrame(sleep=0.1)],
+    )
+
+    assert client.connects == 2
+    assert service.is_usable is True
+    assert [f.text for f in down if isinstance(f, TranscriptionFrame)] == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_connection_that_closes_right_after_opening_is_given_up_on():
+    client = _FakeSarvamClient(_FakeSocket(dropped=True))
+    service = _recovering_service(client)
+
+    _, up = await run_test(service, frames_to_send=[SleepFrame(sleep=0.5)])
+
+    assert client.connects == 3
+    assert service.is_usable is False
+    assert any("in a row" in e for e in _error_messages(up))
+
+
+@pytest.mark.asyncio
+async def test_primary_sarvam_failure_fails_over_to_the_backup():
+    primary = _recovering_service(_FakeSarvamClient(ConnectionError("down")), reconnect_attempts=1)
+    backup = _recovering_service(_FakeSarvamClient(_FakeSocket(reply="from the backup")))
+    switcher = ServiceSwitcher([primary, backup], strategy_type=ServiceSwitcherStrategyFailover)
+
+    down, _ = await run_test(
+        switcher,
+        frames_to_send=[SleepFrame(sleep=0.5), _audio(), SleepFrame(sleep=0.2)],
+    )
+
+    assert primary.is_usable is False
+    assert switcher.strategy.active_service is backup
+    assert [f.text for f in down if isinstance(f, TranscriptionFrame)] == ["from the backup"]
+
+
+def test_keepalive_defaults_on_and_can_be_disabled():
+    assert SarvamSTTService(api_key="test-key")._keepalive_timeout == 10.0
+    assert SarvamSTTService(api_key="test-key", keepalive_timeout=None)._keepalive_timeout is None
+    assert SarvamRealtimeSTTService(api_key="test-key")._keepalive_timeout == 10.0
+    assert (
+        SarvamRealtimeSTTService(api_key="test-key", keepalive_timeout=None)._keepalive_timeout
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_idle_connection_sends_keepalive_silence():
+    socket = _FakeSocket()
+    service = _recovering_service(
+        _FakeSarvamClient(socket), keepalive_timeout=0.05, keepalive_interval=0.02
+    )
+
+    await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    assert socket.sent
+    silence = base64.b64decode(socket.sent[0]["audio"])
+    assert silence == b"\x00" * len(silence)
+
+
+@pytest.mark.asyncio
+async def test_failed_keepalive_triggers_reconnect():
+    first = _FakeSocket(fail_send=True)
+    second = _FakeSocket()
+    client = _FakeSarvamClient(first, second)
+    service = _recovering_service(client, keepalive_timeout=0.05, keepalive_interval=0.02)
+
+    await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    assert client.connects == 2
+    assert second.sent
+    assert service.is_usable is True
+
+
+@pytest.mark.asyncio
+async def test_end_frame_does_not_reconnect_or_mark_unusable():
+    socket = _FakeSocket()
+    client = _FakeSarvamClient(socket)
+    service = _recovering_service(client)
+
+    _, up = await run_test(service, frames_to_send=[_audio(), SleepFrame(sleep=0.1)])
+    await asyncio.sleep(0.1)
+
+    assert client.connects == 1
+    assert service.is_usable is True
+    assert service._recovery_task is None
+    assert _error_messages(up) == []
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_ending_during_intentional_disconnect_is_not_a_drop():
+    socket = _FakeSocket(dropped=True)
+    service = _recovering_service(_FakeSarvamClient(socket))
+    service._socket_client = socket
+    service._disconnecting = True
+
+    await service._receive_task_handler()
+
+    assert service._recovery_task is None
+    assert service.is_usable is True
+
+
+#
+# Failure handling for the realtime service.
+#
+
+
+@pytest.mark.asyncio
+async def test_realtime_connect_that_never_opens_is_retried_then_makes_the_service_unusable(
+    monkeypatch,
+):
+    connect = AsyncMock(side_effect=ConnectionError("no route to host"))
+    monkeypatch.setattr("pipecat.services.websocket_service.websocket_connect", connect)
+    monkeypatch.setattr("pipecat.services.sarvam.stt._REALTIME_CONNECT_RETRY_WAIT", 0)
+    service = SarvamRealtimeSTTService(api_key="test-key")
+    monkeypatch.setattr(service, "push_frame", AsyncMock())
+    monkeypatch.setattr(service, "create_task", lambda coro, *a, **k: coro.close())
+
+    await service._connect()
+
+    assert connect.await_count == 2
+    assert service._websocket is None
+    assert service.is_usable is False
+
+
+@pytest.mark.asyncio
+async def test_realtime_connect_succeeds_on_retry(monkeypatch):
+    connect = AsyncMock(side_effect=[ConnectionError("flaky"), _FakeWebsocket()])
+    monkeypatch.setattr("pipecat.services.websocket_service.websocket_connect", connect)
+    monkeypatch.setattr("pipecat.services.sarvam.stt._REALTIME_CONNECT_RETRY_WAIT", 0)
+    service = SarvamRealtimeSTTService(api_key="test-key")
+    monkeypatch.setattr(service, "push_frame", AsyncMock())
+    monkeypatch.setattr(service, "create_task", lambda coro, *a, **k: coro.close())
+
+    await service._connect()
+
+    assert connect.await_count == 2
+    assert service._websocket is not None
+    assert service.is_usable is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_fatal, usable", [(True, False), (False, True), (None, True)])
+async def test_realtime_provider_fatal_error_makes_the_service_unusable(
+    monkeypatch, is_fatal, usable
+):
+    service = SarvamRealtimeSTTService(api_key="test-key")
+    monkeypatch.setattr(service, "push_frame", AsyncMock())
+    payload = {"event": "error", "code": "invalid_subscription_key"}
+    if is_fatal is not None:
+        payload["is_fatal"] = is_fatal
+
+    await service._handle_message(payload)
+
+    assert service.is_usable is usable
+
+
+class _HangingConnection:
+    async def __aenter__(self):
+        await asyncio.Event().wait()
+
+    async def __aexit__(self, *exc_info):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_sdk_connect_timeout_marks_service_unusable():
+    client = _FakeSarvamClient(_FakeSocket())
+    client.connect = lambda **kwargs: _HangingConnection()
+    service = _recovering_service(client, connect_timeout=0.1)
+    service.push_frame = AsyncMock()
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    connected = await asyncio.wait_for(service._connect(), timeout=2)
+
+    assert connected is False
+    assert loop.time() - start < 1
+    assert service.is_usable is False
+    assert service._recovery_task is None
+
+
+@pytest.mark.asyncio
+async def test_realtime_connect_timeout_marks_service_unusable_without_retry(monkeypatch):
+    calls = 0
+
+    async def hang(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.Event().wait()
+
+    service = SarvamRealtimeSTTService(api_key="test-key", connect_timeout=0.1)
+    monkeypatch.setattr(service, "_websocket_connect", hang)
+    monkeypatch.setattr(WebsocketSTTService, "_connect", _noop)
+    monkeypatch.setattr(service, "push_frame", AsyncMock())
+
+    await asyncio.wait_for(service._connect(), timeout=2)
+
+    assert calls == 1
+    assert service._websocket is None
+    assert service.is_usable is False

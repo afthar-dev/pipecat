@@ -79,6 +79,10 @@ class FastAPIWebsocketParams(TransportParams):
             torn down on the provider's side) from stalling pipeline shutdown on
             the ASGI server's close-handshake timeout. Increase it for
             high-latency peers that need longer to complete a graceful close.
+        audio_pacing_factor: How much faster than real time outbound audio is
+            written to the socket. 2.0 (default) sends each chunk at twice
+            playback speed; 1.0 paces writes at real time, so the transport's
+            "bot stopped speaking" matches what the remote end has played.
     """
 
     add_wav_header: bool = False
@@ -87,6 +91,7 @@ class FastAPIWebsocketParams(TransportParams):
     fixed_audio_packet_size: int | None = None
     allowed_origins: list[str] = Field(default_factory=default_allowed_origins)
     ws_close_timeout: float = _WS_CLOSE_TIMEOUT_DEFAULT
+    audio_pacing_factor: float = Field(default=2.0, gt=0)
 
 
 class FastAPIWebsocketCallbacks(BaseModel):
@@ -465,7 +470,9 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         """
         await super().setup(setup)
 
-        self._send_interval = (self.audio_chunk_size / self.sample_rate) / 2
+        self._send_interval = (
+            self.audio_chunk_size / self.sample_rate
+        ) / self._params.audio_pacing_factor
 
         await self._client.setup(setup)
 

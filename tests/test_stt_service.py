@@ -6,6 +6,7 @@
 
 """Tests for the audio handling shared by every STTService."""
 
+import asyncio
 from collections.abc import AsyncGenerator
 
 import pytest
@@ -77,3 +78,46 @@ async def test_output_audio_is_forwarded_even_without_audio_passthrough():
     )
 
     assert service.captured == [INPUT_PCM]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_replays_buffer_in_order_with_live_frames_arriving_during_replay():
+    from pipecat.frames.frames import InputAudioRawFrame
+    from pipecat.processors.frame_processor import FrameDirection
+    from pipecat.services.stt_service import STTService
+
+    class _S(STTService):
+        def __init__(self):
+            super().__init__()
+            self.order = []
+            self.live = None
+
+        async def run_stt(self, audio):
+            yield None
+
+        async def _process_audio_frame_unbuffered(self, frame, direction):
+            self.order.append(frame.audio)
+            if frame.audio == b"\x01" and self.live is not None:
+                # A live frame arrives while the replay is mid-flight.
+                live, self.live = self.live, None
+                await self.process_audio_frame(live, direction)
+            await asyncio.sleep(0)
+
+    def f(b):
+        return InputAudioRawFrame(audio=b, sample_rate=16000, num_channels=1)
+
+    service = _S()
+
+    async def fake_do_reconnect():
+        service._reconnect_audio_buffer.extend(
+            [(f(b"\x01"), FrameDirection.DOWNSTREAM), (f(b"\x02"), FrameDirection.DOWNSTREAM)]
+        )
+
+    service._do_reconnect = fake_do_reconnect
+    service.live = f(b"\x03")
+
+    await service._reconnect()
+
+    assert service.order == [b"\x01", b"\x02", b"\x03"]
+    assert service._reconnecting is False
+    assert service._reconnect_audio_buffer == []

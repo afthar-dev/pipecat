@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import time
 import unittest
 
 from pipecat.frames.frames import (
@@ -80,6 +81,16 @@ def _empty_turn() -> list[Frame]:
     return [
         VADUserStartedSpeakingFrame(),
         VADUserStoppedSpeakingFrame(),
+        SleepFrame(sleep=USER_TURN_STOP_TIMEOUT + 0.2),
+    ]
+
+
+def _empty_turn_with_speech(secs: float) -> list[Frame]:
+    """An empty turn whose VAD speech lasted `secs`."""
+    now = time.time()
+    return [
+        VADUserStartedSpeakingFrame(start_secs=0.0, timestamp=now),
+        VADUserStoppedSpeakingFrame(stop_secs=0.0, timestamp=now + secs),
         SleepFrame(sleep=USER_TURN_STOP_TIMEOUT + 0.2),
     ]
 
@@ -174,6 +185,44 @@ class TestEmptyUserTurn(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(_developer_messages(context), [IDLE_PROMPT])
         self.assertEqual(inferences, 1)
+
+    async def test_idle_blip_under_min_speech_is_ignored(self):
+        context, inferences = await self._run(
+            [*_bot_idle(), *_empty_turn_with_speech(0.2)],
+            empty_user_turn=self._config(idle_prompt=IDLE_PROMPT, idle_min_speech_secs=0.6),
+        )
+        self.assertEqual(_developer_messages(context), [])
+        self.assertEqual(inferences, 0)
+
+    async def test_idle_speech_over_min_is_reprompted(self):
+        context, _ = await self._run(
+            [*_bot_idle(), *_empty_turn_with_speech(1.0)],
+            empty_user_turn=self._config(idle_prompt=IDLE_PROMPT, idle_min_speech_secs=0.6),
+        )
+        self.assertEqual(_developer_messages(context), [IDLE_PROMPT])
+
+    async def test_interrupted_ignores_min_speech(self):
+        context, _ = await self._run(
+            [*_bot_speaking(), *_empty_turn_with_speech(0.1)],
+            empty_user_turn=self._config(idle_prompt=IDLE_PROMPT, idle_min_speech_secs=0.6),
+        )
+        self.assertEqual(_developer_messages(context), [INTERRUPTED_PROMPT])
+
+    async def test_repeat_prompt_then_quiet(self):
+        context, _ = await self._run(
+            [
+                *_bot_idle(),
+                *_empty_turn_with_speech(1.0),
+                *_empty_turn_with_speech(1.0),
+                *_empty_turn_with_speech(1.0),
+            ],
+            empty_user_turn=self._config(
+                idle_prompt=IDLE_PROMPT,
+                repeat_prompt="say it louder",
+                max_consecutive_recoveries=2,
+            ),
+        )
+        self.assertEqual(_developer_messages(context), [IDLE_PROMPT, "say it louder"])
 
     async def test_idle_after_response_finished(self):
         context, _ = await self._run(

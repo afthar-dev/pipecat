@@ -13,6 +13,7 @@ LLM processing, and text-to-speech components in conversational AI pipelines.
 
 import asyncio
 import json
+import time
 import warnings
 from abc import abstractmethod
 from collections.abc import Callable, Coroutine
@@ -738,6 +739,12 @@ class LLMUserAggregator(LLMContextAggregator):
         # Whether the current user turn interrupted the bot.
         self._user_turn_interrupted_bot = False
         self._consecutive_empty_user_turn_recoveries = 0
+        # VAD-detected speech in the current user turn, for the empty-turn gate
+        # and for subscribers (valid inside ``on_user_turn_stopped``).
+        self._vad_speech_started_at: float | None = None
+        self._user_turn_speech_secs = 0.0
+        self.last_user_turn_speech_secs = 0.0
+        self.last_user_turn_interrupted_bot = False
 
         self._user_turn_controller = UserTurnController(
             user_turn_strategies=user_turn_strategies,
@@ -903,6 +910,8 @@ class LLMUserAggregator(LLMContextAggregator):
         else:
             await self.push_frame(frame, direction)
 
+        self._track_vad_speech(frame)
+
         if self._vad_controller:
             await self._vad_controller.process_frame(frame)
 
@@ -913,6 +922,20 @@ class LLMUserAggregator(LLMContextAggregator):
     async def push_aggregation(self) -> str:
         """Push the current aggregation."""
         return await self._push_aggregation()
+
+    def _track_vad_speech(self, frame: Frame):
+        """Add the VAD-detected speech of the current user turn.
+
+        Frame times are when the VAD decided; its confirmation windows are
+        subtracted so the figure is the speech itself.
+        """
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._vad_speech_started_at = frame.timestamp - frame.start_secs
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            if self._vad_speech_started_at is not None:
+                ended = frame.timestamp - frame.stop_secs
+                self._user_turn_speech_secs += max(0.0, ended - self._vad_speech_started_at)
+            self._vad_speech_started_at = None
 
     async def _push_aggregation(self, *, run_llm: bool = True) -> str:
         """Write the aggregated user turn to the context.
@@ -1545,6 +1568,13 @@ class LLMUserAggregator(LLMContextAggregator):
                 (avoids duplicate events when session ends).
             run_llm: Whether the context write should run inference.
         """
+        speech_secs = self._user_turn_speech_secs
+        if self._vad_speech_started_at is not None:
+            speech_secs += max(0.0, time.time() - self._vad_speech_started_at)
+        self._user_turn_speech_secs = 0.0
+        self.last_user_turn_speech_secs = speech_secs
+        self.last_user_turn_interrupted_bot = self._user_turn_interrupted_bot
+
         segment = await self._push_aggregation(run_llm=run_llm)
         full_aggregation = self._full_user_turn_aggregation
         self._full_user_turn_aggregation = None
@@ -1570,14 +1600,17 @@ class LLMUserAggregator(LLMContextAggregator):
             # An empty turn doesn't run the LLM, so the bot stays silent unless
             # a recovery runs it. Without one, restart the idle timer, which
             # this turn's start cancelled.
-            if not await self._maybe_recover_empty_user_turn(interrupted_bot):
+            if not await self._maybe_recover_empty_user_turn(interrupted_bot, speech_secs):
                 await self._user_idle_controller.wait_for_user()
 
-    async def _maybe_recover_empty_user_turn(self, interrupted_bot: bool) -> bool:
+    async def _maybe_recover_empty_user_turn(
+        self, interrupted_bot: bool, speech_secs: float = 0.0
+    ) -> bool:
         """Run the LLM for a user turn that ended with no transcript.
 
         Args:
             interrupted_bot: Whether the turn interrupted a response in progress.
+            speech_secs: VAD-detected speech in the turn.
 
         Returns:
             Whether the LLM was asked to respond.
@@ -1589,6 +1622,11 @@ class LLMUserAggregator(LLMContextAggregator):
         prompt = config.interrupted_prompt if interrupted_bot else config.idle_prompt
         if not prompt:
             return False
+        if not interrupted_bot and speech_secs < config.idle_min_speech_secs:
+            logger.debug(f"{self}: Empty idle user turn ignored ({speech_secs:.2f}s of speech)")
+            return False
+        if self._consecutive_empty_user_turn_recoveries > 0 and config.repeat_prompt:
+            prompt = config.repeat_prompt
 
         if self._consecutive_empty_user_turn_recoveries >= config.max_consecutive_recoveries:
             logger.debug(f"{self}: Empty user turn left unanswered (too many in a row)")
