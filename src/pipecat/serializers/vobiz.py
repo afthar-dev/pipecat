@@ -8,6 +8,7 @@
 
 import base64
 import json
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
@@ -26,6 +27,10 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.utils.enums import EndTaskReason
+
+if TYPE_CHECKING:
+    from pipecat.serializers.call_strategies import TransferStrategy
 
 
 class VobizFrameSerializer(FrameSerializer):
@@ -60,6 +65,7 @@ class VobizFrameSerializer(FrameSerializer):
         call_id: str | None = None,
         auth_id: str | None = None,
         auth_token: str | None = None,
+        transfer_strategy: "TransferStrategy | None" = None,
         params: InputParams | None = None,
     ):
         """Initialize the VobizFrameSerializer.
@@ -69,6 +75,7 @@ class VobizFrameSerializer(FrameSerializer):
             call_id: The associated Vobiz Call ID (optional, but required for auto hang-up).
             auth_id: Vobiz auth ID (required for auto hang-up).
             auth_token: Vobiz auth token (required for auto hang-up).
+            transfer_strategy: Strategy invoked when the pipeline ends for a transfer.
             params: Configuration parameters.
         """
         params = params or VobizFrameSerializer.InputParams()
@@ -95,6 +102,7 @@ class VobizFrameSerializer(FrameSerializer):
         self._call_id = call_id
         self._auth_id = auth_id
         self._auth_token = auth_token
+        self._transfer_strategy = transfer_strategy
 
         self._vobiz_sample_rate = self._params.vobiz_sample_rate
         self._sample_rate = 0  # Pipeline input rate
@@ -106,6 +114,7 @@ class VobizFrameSerializer(FrameSerializer):
             clear_after_secs=self._params.resampler_clear_after_secs
         )
         self._hangup_attempted = False
+        self._transfer_attempted = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Sets up the serializer with pipeline configuration.
@@ -128,6 +137,24 @@ class VobizFrameSerializer(FrameSerializer):
             Serialized data as string or bytes, or None if the frame isn't handled.
         """
         if (
+            isinstance(frame, (EndFrame, CancelFrame))
+            and getattr(frame, "reason", None) == EndTaskReason.TRANSFER_CALL.value
+            and not self._transfer_attempted
+        ):
+            # The call is handed to the transfer strategy; it must stay up.
+            self._transfer_attempted = True
+            if self._transfer_strategy:
+                context = {
+                    "call_id": self._call_id,
+                    "auth_id": self._auth_id,
+                    "auth_token": self._auth_token,
+                }
+                if not await self._transfer_strategy.execute_transfer(context):
+                    logger.error(f"Transfer strategy failed for Vobiz call {self._call_id}")
+            else:
+                logger.warning(f"No transfer strategy configured for Vobiz call {self._call_id}")
+            return None
+        elif (
             self._params.auto_hang_up
             and not self._hangup_attempted
             and isinstance(frame, (EndFrame, CancelFrame))
